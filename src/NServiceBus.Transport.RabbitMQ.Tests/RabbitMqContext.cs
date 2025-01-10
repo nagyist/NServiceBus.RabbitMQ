@@ -3,7 +3,7 @@
     using System;
     using System.Collections.Concurrent;
     using System.Collections.Generic;
-    using System.Linq;
+    using System.Threading;
     using System.Threading.Tasks;
     using NUnit.Framework;
 
@@ -12,37 +12,37 @@
         public virtual int MaximumConcurrency => 1;
 
         [SetUp]
-        public async Task SetUp()
+        public virtual async Task SetUp()
         {
-            receivedMessages = new BlockingCollection<IncomingMessage>();
+            receivedMessages = [];
 
             var connectionString = Environment.GetEnvironmentVariable("RabbitMQTransport_ConnectionString") ?? "host=localhost";
 
             var useTls = connectionString.StartsWith("https", StringComparison.InvariantCultureIgnoreCase) || connectionString.StartsWith("amqps", StringComparison.InvariantCultureIgnoreCase);
 
-            var transport = new RabbitMQTransport(RoutingTopology.Conventional(QueueType.Classic), connectionString);
+            var transport = new RabbitMQTransport(RoutingTopology.Conventional(queueType), connectionString);
             var connectionConfig = transport.ConnectionConfiguration;
 
             connectionFactory = new ConnectionFactory(ReceiverQueue, connectionConfig, null, true, false, transport.HeartbeatInterval, transport.NetworkRecoveryInterval, null);
 
-            infra = await transport.Initialize(new HostSettings(ReceiverQueue, ReceiverQueue, new StartupDiagnosticEntries(),
-                (_, __, ___) => { }, true), new[]
-            {
-                new ReceiveSettings(ReceiverQueue, new QueueAddress(ReceiverQueue), true, true, "error")
-            }, AdditionalReceiverQueues.Concat(new[] { ErrorQueue }).ToArray());
+            infra = await transport.Initialize(new HostSettings(ReceiverQueue, ReceiverQueue, new StartupDiagnosticEntries(), (_, _, _) => { }, true),
+                [new ReceiveSettings(ReceiverQueue, new QueueAddress(ReceiverQueue), true, true, ErrorQueue)], [.. AdditionalReceiverQueues, ErrorQueue]);
 
             messageDispatcher = infra.Dispatcher;
             messagePump = infra.Receivers[ReceiverQueue];
             subscriptionManager = messagePump.Subscriptions;
+            OnMessage = (messageContext, cancellationToken) =>
+            {
+                receivedMessages.Add(new IncomingMessage(messageContext.NativeMessageId, messageContext.Headers, messageContext.Body), cancellationToken);
+                return Task.CompletedTask;
+            };
 
-            await messagePump.Initialize(new PushRuntimeSettings(MaximumConcurrency),
-                (messageContext, cancellationToken) =>
-                {
-                    receivedMessages.Add(new IncomingMessage(messageContext.NativeMessageId, messageContext.Headers,
-                        messageContext.Body), cancellationToken);
-                    return Task.CompletedTask;
-                }, (_, __) => Task.FromResult(ErrorHandleResult.Handled)
-            );
+            OnError = (_, _) => Task.FromResult(ErrorHandleResult.Handled);
+
+            await messagePump.Initialize(
+                new PushRuntimeSettings(MaximumConcurrency),
+                (messageContext, cancellationToken) => OnMessage(messageContext, cancellationToken),
+                (errorContext, cancellationToken) => OnError(errorContext, cancellationToken));
 
             await messagePump.StartReceive();
         }
@@ -76,10 +76,17 @@
         bool TryReceiveMessage(out IncomingMessage message, TimeSpan timeout) =>
             receivedMessages.TryTake(out message, timeout);
 
-        protected virtual IEnumerable<string> AdditionalReceiverQueues => Enumerable.Empty<string>();
+        protected IList<string> AdditionalReceiverQueues = [];
 
-        protected const string ReceiverQueue = "testreceiver";
-        protected const string ErrorQueue = "error";
+        protected Func<MessageContext, CancellationToken, Task> OnMessage;
+        protected Func<ErrorContext, CancellationToken, Task<ErrorHandleResult>> OnError;
+
+        protected string ReceiverQueue => GetTestQueueName("testreceiver");
+        protected string ErrorQueue => GetTestQueueName("error");
+
+        protected string GetTestQueueName(string queueName) => $"{queueName}-{queueType}";
+
+        protected QueueType queueType = QueueType.Quorum;
         protected ConnectionFactory connectionFactory;
         protected IMessageDispatcher messageDispatcher;
         protected IMessageReceiver messagePump;
@@ -87,7 +94,7 @@
 
         BlockingCollection<IncomingMessage> receivedMessages;
 
-        static readonly TimeSpan IncomingMessageTimeout = TimeSpan.FromSeconds(5);
+        protected static readonly TimeSpan IncomingMessageTimeout = TimeSpan.FromSeconds(5);
         TransportInfrastructure infra;
     }
 }

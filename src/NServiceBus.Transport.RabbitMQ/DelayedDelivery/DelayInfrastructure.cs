@@ -1,17 +1,21 @@
-﻿namespace NServiceBus.Transport.RabbitMQ
+﻿#nullable enable
+
+namespace NServiceBus.Transport.RabbitMQ
 {
     using System;
-    using System.Collections;
     using System.Collections.Generic;
-    using System.Text;
+    using System.Collections.Specialized;
+    using System.Runtime.CompilerServices;
+    using System.Threading;
+    using System.Threading.Tasks;
     using global::RabbitMQ.Client;
 
     static class DelayInfrastructure
     {
-        const int maxNumberOfBitsToUse = 28;
+        const int MaxNumberOfBitsToUse = 28;
 
-        public const int MaxLevel = maxNumberOfBitsToUse - 1;
-        public const int MaxDelayInSeconds = (1 << maxNumberOfBitsToUse) - 1;
+        public const int MaxLevel = MaxNumberOfBitsToUse - 1;
+        public const int MaxDelayInSeconds = (1 << MaxNumberOfBitsToUse) - 1;
         public const string DelayHeader = "NServiceBus.Transport.RabbitMQ.DelayInSeconds";
         public const string XDeathHeader = "x-death";
         public const string XFirstDeathExchangeHeader = "x-first-death-exchange";
@@ -23,7 +27,7 @@
 
         public static string BindingKey(string address) => $"#.{address}";
 
-        public static void Build(IModel channel)
+        public static async Task Build(IChannel channel, CancellationToken cancellationToken = default)
         {
             var bindingKey = "1.#";
 
@@ -32,9 +36,9 @@
                 var currentLevel = LevelName(level);
                 var nextLevel = LevelName(level - 1);
 
-                channel.ExchangeDeclare(currentLevel, ExchangeType.Topic, true);
+                await channel.ExchangeDeclareAsync(currentLevel, ExchangeType.Topic, true, cancellationToken: cancellationToken).ConfigureAwait(false);
 
-                var arguments = new Dictionary<string, object>
+                var arguments = new Dictionary<string, object?>
                 {
                     { "x-queue-type", "quorum" },
                     { "x-dead-letter-strategy", "at-least-once" },
@@ -43,8 +47,8 @@
                     { "x-dead-letter-exchange", level > 0 ? nextLevel : DeliveryExchange }
                 };
 
-                channel.QueueDeclare(currentLevel, true, false, false, arguments);
-                channel.QueueBind(currentLevel, currentLevel, bindingKey);
+                await channel.QueueDeclareAsync(currentLevel, true, false, false, arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
+                await channel.QueueBindAsync(currentLevel, currentLevel, bindingKey, cancellationToken: cancellationToken).ConfigureAwait(false);
 
                 bindingKey = "*." + bindingKey;
             }
@@ -56,52 +60,74 @@
                 var currentLevel = LevelName(level);
                 var nextLevel = LevelName(level - 1);
 
-                channel.ExchangeBind(nextLevel, currentLevel, bindingKey);
+                await channel.ExchangeBindAsync(nextLevel, currentLevel, bindingKey, cancellationToken: cancellationToken).ConfigureAwait(false);
 
                 bindingKey = "*." + bindingKey;
             }
 
-            channel.ExchangeDeclare(DeliveryExchange, ExchangeType.Topic, true);
-            channel.ExchangeBind(DeliveryExchange, LevelName(0), bindingKey);
+            await channel.ExchangeDeclareAsync(DeliveryExchange, ExchangeType.Topic, true, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await channel.ExchangeBindAsync(DeliveryExchange, LevelName(0), bindingKey, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
-        public static void TearDown(IModel channel)
+        public static async Task TearDown(IChannel channel, CancellationToken cancellationToken = default)
         {
-            channel.ExchangeDelete(DeliveryExchange);
+            await channel.ExchangeDeleteAsync(DeliveryExchange, cancellationToken: cancellationToken).ConfigureAwait(false);
 
             for (var level = MaxLevel; level >= 0; level--)
             {
                 var name = LevelName(level);
-
-                channel.QueueDelete(name);
-                channel.ExchangeDelete(name);
+                await channel.QueueDeleteAsync(name, cancellationToken: cancellationToken).ConfigureAwait(false);
+                await channel.ExchangeDeleteAsync(name, cancellationToken: cancellationToken).ConfigureAwait(false);
             }
         }
 
-        public static string CalculateRoutingKey(int delayInSeconds, string address, out int startingDelayLevel)
+        public static unsafe string CalculateRoutingKey(int delayInSeconds, string address, out int startingDelayLevel)
         {
             if (delayInSeconds < 0)
             {
                 delayInSeconds = 0;
             }
 
-            var bitArray = new BitArray(new[] { delayInSeconds });
-            var sb = new StringBuilder();
             startingDelayLevel = 0;
-
-            for (var level = MaxLevel; level >= 0; level--)
+            // Pinning the address of the startingDelayLevel so that we can safely write back to the address of the local.
+            // This trickery is done because when string.Create returns, there is no way to pass state outside of the lambda
+            // without doing a closure over a local variable, which would create DisplayClass allocations for every call.
+            fixed (int* pinnedStartingDelayLevel = &startingDelayLevel)
             {
-                if (startingDelayLevel == 0 && bitArray[level])
+                var startingDelayLevelPtr = (nint)pinnedStartingDelayLevel;
+
+                // The length of the string is determined by the max level, taking into account the number of dots, the address length
+                // and additional space since we are zero based.
+                return string.Create((2 * MaxLevel) + 2 + address.Length, (delayInSeconds, address, startingDelayLevelPtr), Action);
+
+                static void Action(Span<char> span, (int, string, nint) state)
                 {
-                    startingDelayLevel = level;
+                    var (delayInSeconds, address, startingDelayLevelPtr) = state;
+
+                    var startingDelayLevel = 0;
+                    var mask = BitVector32.CreateMask();
+
+                    var bitVector = new BitVector32(delayInSeconds);
+
+                    var index = 0;
+                    for (var level = MaxLevel; level >= 0; level--)
+                    {
+                        var flag = bitVector[mask << level];
+                        if (startingDelayLevel == 0 && flag)
+                        {
+                            startingDelayLevel = level;
+                        }
+
+                        span[index++] = flag ? '1' : '0';
+                        span[index++] = '.';
+                    }
+
+                    address.AsSpan().CopyTo(span[index..]);
+
+                    // Write back the startingDelayLevel to the address of the local
+                    Unsafe.Write(startingDelayLevelPtr.ToPointer(), startingDelayLevel);
                 }
-
-                sb.Append(bitArray[level] ? "1." : "0.");
             }
-
-            sb.Append(address);
-
-            return sb.ToString();
         }
     }
 }

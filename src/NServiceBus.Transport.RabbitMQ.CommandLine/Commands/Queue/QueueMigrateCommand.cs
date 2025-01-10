@@ -2,10 +2,11 @@
 {
     using System;
     using System.CommandLine;
+    using System.Text;
     using global::RabbitMQ.Client;
     using global::RabbitMQ.Client.Exceptions;
 
-    class QueueMigrateCommand
+    class QueueMigrateCommand(string queueName, BrokerConnection brokerConnection, IConsole console)
     {
         public static Command CreateCommand()
         {
@@ -24,87 +25,74 @@
             command.SetHandler(async (queueName, brokerConnection, console, cancellationToken) =>
             {
                 var migrateCommand = new QueueMigrateCommand(queueName, brokerConnection, console);
-                await migrateCommand.Run(cancellationToken).ConfigureAwait(false);
+                await migrateCommand.Run(cancellationToken);
             },
             queueNameArgument, brokerConnectionBinder, Bind.FromServiceProvider<IConsole>(), Bind.FromServiceProvider<CancellationToken>());
 
             return command;
         }
 
-        public QueueMigrateCommand(string queueName, BrokerConnection brokerConnection, IConsole console)
-        {
-            this.queueName = queueName;
-            this.brokerConnection = brokerConnection;
-            this.console = console;
-            holdingQueueName = $"{queueName}-migration-temp";
-            migrationState = new MigrationState();
-        }
-
-        public Task Run(CancellationToken cancellationToken = default)
+        public async Task Run(CancellationToken cancellationToken = default)
         {
             console.WriteLine($"Starting migration of '{queueName}'");
 
-            using var connection = brokerConnection.Create();
+            await using var connection = await brokerConnection.Create(cancellationToken);
 
-            migrationState.SetInitialMigrationStage(queueName, holdingQueueName, connection);
+            await migrationState.SetInitialMigrationStage(queueName, holdingQueueName, connection, cancellationToken);
 
             while (migrationState.CurrentStage != MigrationStage.CleanUpCompleted)
             {
                 switch (migrationState.CurrentStage)
                 {
                     case MigrationStage.Starting:
-                        migrationState.CurrentStage = MoveMessagesToHoldingQueue(connection, cancellationToken);
+                        migrationState.CurrentStage = await MoveMessagesToHoldingQueue(connection, cancellationToken);
                         break;
                     case MigrationStage.MessagesMovedToHoldingQueue:
-                        migrationState.CurrentStage = DeleteMainQueue(connection);
+                        migrationState.CurrentStage = await DeleteMainQueue(connection, cancellationToken);
                         break;
                     case MigrationStage.ClassicQueueDeleted:
-                        migrationState.CurrentStage = CreateMainQueueAsQuorum(connection);
+                        migrationState.CurrentStage = await CreateMainQueueAsQuorum(connection, cancellationToken);
                         break;
                     case MigrationStage.QuorumQueueCreated:
-                        migrationState.CurrentStage = RestoreMessages(connection, cancellationToken);
+                        migrationState.CurrentStage = await RestoreMessages(connection, cancellationToken);
                         break;
                     case MigrationStage.MessagesMovedToQuorumQueue:
-                        migrationState.CurrentStage = CleanUpHoldingQueue(connection);
+                        migrationState.CurrentStage = await CleanUpHoldingQueue(connection, cancellationToken);
                         break;
                     case MigrationStage.CleanUpCompleted:
                     default:
                         break;
                 }
             }
-
-            return Task.CompletedTask;
         }
 
-        MigrationStage MoveMessagesToHoldingQueue(IConnection connection, CancellationToken cancellationToken)
+        async Task<MigrationStage> MoveMessagesToHoldingQueue(IConnection connection, CancellationToken cancellationToken)
         {
-            using var channel = connection.CreateModel();
+            var createChannelOptions = new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true, outstandingPublisherConfirmationsRateLimiter: null);
+            await using var channel = await connection.CreateChannelAsync(createChannelOptions, cancellationToken);
 
             console.WriteLine($"Migrating messages from '{queueName}' to '{holdingQueueName}'");
 
             // does the holding queue need to be quorum?
-            channel.QueueDeclare(holdingQueueName, true, false, false, quorumQueueArguments);
+            await channel.QueueDeclareAsync(holdingQueueName, true, false, false, quorumQueueArguments, cancellationToken: cancellationToken);
             console.WriteLine($"Created queue '{holdingQueueName}'");
 
             // bind the holding queue to the exchange of the queue under migration
             // this will throw if the exchange for the queue doesn't exist
-            channel.QueueBind(holdingQueueName, queueName, emptyRoutingKey);
+            await channel.QueueBindAsync(holdingQueueName, queueName, string.Empty, cancellationToken: cancellationToken);
             console.WriteLine($"Bound '{holdingQueueName}' to exchange '{queueName}'");
 
             // unbind the queue under migration to stop more messages from coming in
-            channel.QueueUnbind(queueName, queueName, emptyRoutingKey);
+            await channel.QueueUnbindAsync(queueName, queueName, string.Empty, cancellationToken: cancellationToken);
             console.WriteLine($"Unbound '{queueName}' from exchange '{queueName}' ");
 
             // move all existing messages to the holding queue
-            channel.ConfirmSelect();
-
-            var numMessagesMovedToHolding = ProcessMessages(
+            var numMessagesMovedToHolding = await ProcessMessages(
                 channel,
                 queueName,
-                message =>
+                async (message, token) =>
                 {
-                    channel.BasicPublish(emptyRoutingKey, holdingQueueName, message.BasicProperties, message.Body);
-                    channel.WaitForConfirmsOrDie();
+                    await channel.BasicPublishAsync(string.Empty, holdingQueueName, false, new BasicProperties(message.BasicProperties), message.Body, cancellationToken: token);
                 },
                 cancellationToken);
 
@@ -113,57 +101,59 @@
             return MigrationStage.MessagesMovedToHoldingQueue;
         }
 
-        MigrationStage DeleteMainQueue(IConnection connection)
+        async Task<MigrationStage> DeleteMainQueue(IConnection connection, CancellationToken cancellationToken)
         {
-            using var channel = connection.CreateModel();
+            await using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
-            if (channel.MessageCount(queueName) > 0)
+            if (await channel.MessageCountAsync(queueName, cancellationToken) > 0)
             {
                 throw new Exception($"Queue '{queueName}' is not empty after message processing. This can occur if messages are being published directly to the queue during the migration process. Run the command again to retry message processing.");
             }
 
             // delete the queue under migration
-            channel.QueueDelete(queueName);
+            await channel.QueueDeleteAsync(queueName, cancellationToken: cancellationToken);
             console.WriteLine($"Removed '{queueName}'");
 
             return MigrationStage.ClassicQueueDeleted;
         }
 
-        MigrationStage CreateMainQueueAsQuorum(IConnection connection)
+        async Task<MigrationStage> CreateMainQueueAsQuorum(IConnection connection, CancellationToken cancellationToken)
         {
-            using var channel = connection.CreateModel();
+            await using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
-            channel.QueueDeclare(queueName, true, false, false, quorumQueueArguments);
+            await channel.QueueDeclareAsync(queueName, true, false, false, quorumQueueArguments, cancellationToken: cancellationToken);
             console.WriteLine($"Recreated '{queueName}' as a quorum queue");
 
             return MigrationStage.QuorumQueueCreated;
         }
 
-        MigrationStage RestoreMessages(IConnection connection, CancellationToken cancellationToken)
+        async Task<MigrationStage> RestoreMessages(IConnection connection, CancellationToken cancellationToken)
         {
-            using var channel = connection.CreateModel();
+            var createChannelOptions = new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true, outstandingPublisherConfirmationsRateLimiter: null);
+            await using var channel = await connection.CreateChannelAsync(createChannelOptions, cancellationToken);
 
-            channel.QueueBind(queueName, queueName, emptyRoutingKey);
+            await channel.QueueBindAsync(queueName, queueName, string.Empty, cancellationToken: cancellationToken);
             console.WriteLine($"Re-bound '{queueName}' to exchange '{queueName}'");
 
-            channel.QueueUnbind(holdingQueueName, queueName, emptyRoutingKey);
+            await channel.QueueUnbindAsync(holdingQueueName, queueName, string.Empty, cancellationToken: cancellationToken);
             console.WriteLine($"Unbound '{holdingQueueName}' from exchange '{queueName}'");
 
             var messageIds = new Dictionary<string, string>();
 
             // move all messages in the holding queue back to the main queue
-            channel.ConfirmSelect();
-
-            var numMessageMovedBackToMain = ProcessMessages(
+            var numMessageMovedBackToMain = await ProcessMessages(
                 channel,
                 holdingQueueName,
-                message =>
+                async (message, token) =>
                 {
                     string? messageIdString = null;
 
-                    if (message.BasicProperties.Headers.TryGetValue("NServiceBus.MessageId", out var messageId))
+                    if (message.BasicProperties.Headers != null && message.BasicProperties.Headers.TryGetValue("NServiceBus.MessageId", out var messageId))
                     {
-                        messageIdString = messageId?.ToString();
+                        if (messageId is byte[] bytes)
+                        {
+                            messageIdString = Encoding.UTF8.GetString(bytes);
+                        }
 
                         if (messageIdString != null && messageIds.ContainsKey(messageIdString))
                         {
@@ -171,8 +161,7 @@
                         }
                     }
 
-                    channel.BasicPublish(emptyRoutingKey, queueName, message.BasicProperties, message.Body);
-                    channel.WaitForConfirmsOrDie();
+                    await channel.BasicPublishAsync(string.Empty, queueName, false, new BasicProperties(message.BasicProperties), message.Body, cancellationToken: token);
 
                     if (messageIdString != null)
                     {
@@ -186,30 +175,30 @@
             return MigrationStage.MessagesMovedToQuorumQueue;
         }
 
-        MigrationStage CleanUpHoldingQueue(IConnection connection)
+        async Task<MigrationStage> CleanUpHoldingQueue(IConnection connection, CancellationToken cancellationToken)
         {
-            using var channel = connection.CreateModel();
+            await using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
-            if (channel.MessageCount(holdingQueueName) != 0)
+            if (await channel.MessageCountAsync(holdingQueueName, cancellationToken) != 0)
             {
                 throw new Exception($"'{holdingQueueName}' is not empty and was not deleted. Run the command again to retry message processing.");
             }
 
-            channel.QueueDelete(holdingQueueName);
+            await channel.QueueDeleteAsync(holdingQueueName, cancellationToken: cancellationToken);
             console.WriteLine($"Removed '{holdingQueueName}'");
 
             return MigrationStage.CleanUpCompleted;
         }
 
-        uint ProcessMessages(IModel channel, string sourceQueue, Action<BasicGetResult> onMoveMessage, CancellationToken cancellationToken)
+        async Task<uint> ProcessMessages(IChannel channel, string sourceQueue, Func<BasicGetResult, CancellationToken, Task> onMoveMessage, CancellationToken cancellationToken)
         {
-            var messageCount = channel.MessageCount(sourceQueue);
+            var messageCount = await channel.MessageCountAsync(sourceQueue, cancellationToken);
 
             for (var i = 0; i < messageCount; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var message = channel.BasicGet(sourceQueue, false);
+                var message = await channel.BasicGetAsync(sourceQueue, false, cancellationToken);
 
                 if (message == null)
                 {
@@ -217,22 +206,18 @@
                     break;
                 }
 
-                onMoveMessage(message);
+                await onMoveMessage(message, cancellationToken);
 
-                channel.BasicAck(message.DeliveryTag, false);
+                await channel.BasicAckAsync(message.DeliveryTag, false, cancellationToken);
             }
 
             return messageCount;
         }
 
-        readonly string queueName;
-        readonly string holdingQueueName;
-        readonly BrokerConnection brokerConnection;
-        readonly IConsole console;
-        readonly MigrationState migrationState;
+        readonly string holdingQueueName = $"{queueName}-migration-temp";
+        readonly MigrationState migrationState = new();
 
-        static string emptyRoutingKey = string.Empty;
-        static Dictionary<string, object> quorumQueueArguments = new Dictionary<string, object> { { "x-queue-type", "quorum" } };
+        static readonly Dictionary<string, object?> quorumQueueArguments = new() { { "x-queue-type", "quorum" } };
 
         enum MigrationStage
         {
@@ -254,9 +239,9 @@
 
             public MigrationStage CurrentStage { get; set; }
 
-            public void SetInitialMigrationStage(string queueName, string holdingQueueName, IConnection connection)
+            public async Task SetInitialMigrationStage(string queueName, string holdingQueueName, IConnection connection, CancellationToken cancellationToken = default)
             {
-                SetBrokerState(queueName, holdingQueueName, connection);
+                await SetBrokerState(queueName, holdingQueueName, connection, cancellationToken);
 
                 if (mainQueueIsQuorum)
                 {
@@ -301,13 +286,13 @@
                 }
             }
 
-            void SetBrokerState(string queueName, string holdingQueueName, IConnection connection)
+            async Task SetBrokerState(string queueName, string holdingQueueName, IConnection connection, CancellationToken cancellationToken)
             {
-                var channel = connection.CreateModel();
+                var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
                 try
                 {
-                    channel.ExchangeDeclarePassive(queueName);
+                    await channel.ExchangeDeclarePassiveAsync(queueName, cancellationToken);
                 }
                 catch (OperationInterruptedException)
                 {
@@ -317,29 +302,29 @@
                 try
                 {
                     // make sure that the queue exists
-                    channel.QueueDeclarePassive(queueName);
+                    await channel.QueueDeclarePassiveAsync(queueName, cancellationToken);
 
                     mainQueueExists = true;
-                    mainQueueHasMessages = channel.MessageCount(queueName) > 0;
+                    mainQueueHasMessages = await channel.MessageCountAsync(queueName, cancellationToken) > 0;
 
-                    channel.QueueDeclare(queueName, true, false, false, quorumQueueArguments);
+                    await channel.QueueDeclareAsync(queueName, true, false, false, quorumQueueArguments, cancellationToken: cancellationToken);
                     mainQueueIsQuorum = true;
                 }
                 catch (OperationInterruptedException)
                 {
-                    channel.Close();
+                    await channel.CloseAsync(cancellationToken);
                     channel.Dispose();
 
-                    channel = connection.CreateModel();
+                    channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
                 }
 
                 try
                 {
-                    channel.QueueDeclarePassive(holdingQueueName);
+                    await channel.QueueDeclarePassiveAsync(holdingQueueName, cancellationToken);
 
                     holdingQueueExists = true;
 
-                    holdingQueueHasMessages = channel.MessageCount(holdingQueueName) > 0;
+                    holdingQueueHasMessages = await channel.MessageCountAsync(holdingQueueName, cancellationToken) > 0;
                 }
                 catch (OperationInterruptedException)
                 {
@@ -347,7 +332,7 @@
                 }
                 finally
                 {
-                    channel.Close();
+                    await channel.CloseAsync(cancellationToken);
                     channel.Dispose();
                 }
             }
