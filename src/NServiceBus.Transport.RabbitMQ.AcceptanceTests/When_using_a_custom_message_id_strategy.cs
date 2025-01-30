@@ -25,8 +25,11 @@
                    .Done(c => c.GotTheMessage)
                    .Run();
 
-            Assert.True(context.GotTheMessage, "Should receive the message");
-            Assert.AreEqual(context.ReceivedMessageId, CustomMessageId, "Message id should equal custom id value");
+            Assert.Multiple(() =>
+            {
+                Assert.That(context.GotTheMessage, Is.True, "Should receive the message");
+                Assert.That(context.ReceivedMessageId, Is.EqualTo(CustomMessageId), "Message id should equal custom id value");
+            });
         }
 
         public class Receiver : EndpointConfigurationBuilder
@@ -59,7 +62,7 @@
                     protected override Task OnStart(IMessageSession session, CancellationToken cancellationToken = default)
                     {
                         //Use feature to send message that has no message id
-                        var messageBody = "<MyRequest></MyRequest>";
+                        var messageBody = "{}";
 
                         var message = new OutgoingMessage(
                             string.Empty,

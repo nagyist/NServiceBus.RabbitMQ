@@ -1,7 +1,6 @@
 ﻿namespace NServiceBus.Transport.RabbitMQ.Tests
 {
     using System;
-    using System.Collections.Generic;
     using System.Linq;
     using System.Text;
     using System.Threading;
@@ -12,26 +11,35 @@
     [TestFixture]
     class When_sending_a_message_over_rabbitmq : RabbitMqContext
     {
-        const string QueueToReceiveOn = "testEndPoint";
+        string QueueToReceiveOn;
+
+        [SetUp]
+        public override Task SetUp()
+        {
+            QueueToReceiveOn = GetTestQueueName("testendpoint");
+            AdditionalReceiverQueues.Add(QueueToReceiveOn);
+
+            return base.SetUp();
+        }
 
         [Test]
         public Task Should_populate_the_body()
         {
             var body = Encoding.UTF8.GetBytes("<TestMessage/>");
 
-            return Verify(new OutgoingMessageBuilder().WithBody(body), (IncomingMessage received) => Assert.IsTrue(received.Body.Span.SequenceEqual(body)));
+            return Verify(new OutgoingMessageBuilder().WithBody(body), (IncomingMessage received) => Assert.That(received.Body.Span.SequenceEqual(body), Is.True));
         }
 
         [Test]
         public Task Should_set_the_content_type()
         {
-            return Verify(new OutgoingMessageBuilder().WithHeader(Headers.ContentType, "application/json"), received => Assert.AreEqual("application/json", received.BasicProperties.ContentType));
+            return Verify(new OutgoingMessageBuilder().WithHeader(Headers.ContentType, "application/json"), received => Assert.That(received.BasicProperties.ContentType, Is.EqualTo("application/json")));
         }
 
         [Test]
         public Task Should_default_the_content_type_to_octet_stream_when_no_content_type_is_specified()
         {
-            return Verify(new OutgoingMessageBuilder(), received => Assert.AreEqual("application/octet-stream", received.BasicProperties.ContentType));
+            return Verify(new OutgoingMessageBuilder(), received => Assert.That(received.BasicProperties.ContentType, Is.EqualTo("application/octet-stream")));
         }
 
         [Test]
@@ -39,7 +47,7 @@
         {
             var messageType = typeof(MyMessage);
 
-            return Verify(new OutgoingMessageBuilder().WithHeader(Headers.EnclosedMessageTypes, messageType.AssemblyQualifiedName), received => Assert.AreEqual(messageType.FullName, received.BasicProperties.Type));
+            return Verify(new OutgoingMessageBuilder().WithHeader(Headers.EnclosedMessageTypes, messageType.AssemblyQualifiedName), received => Assert.That(received.BasicProperties.Type, Is.EqualTo(messageType.FullName)));
         }
 
         [Test]
@@ -47,7 +55,7 @@
         {
             var timeToBeReceived = TimeSpan.FromDays(1);
 
-            return Verify(new OutgoingMessageBuilder().TimeToBeReceived(timeToBeReceived), received => Assert.AreEqual(timeToBeReceived.TotalMilliseconds.ToString(), received.BasicProperties.Expiration));
+            return Verify(new OutgoingMessageBuilder().TimeToBeReceived(timeToBeReceived), received => Assert.That(received.BasicProperties.Expiration, Is.EqualTo(timeToBeReceived.TotalMilliseconds.ToString())));
         }
 
         [Test]
@@ -58,8 +66,11 @@
             return Verify(new OutgoingMessageBuilder().ReplyToAddress(address),
                 (t, r) =>
                 {
-                    Assert.AreEqual(address, t.Headers[Headers.ReplyToAddress]);
-                    Assert.AreEqual(address, r.BasicProperties.ReplyTo);
+                    Assert.Multiple(() =>
+                    {
+                        Assert.That(t.Headers[Headers.ReplyToAddress], Is.EqualTo(address));
+                        Assert.That(r.BasicProperties.ReplyTo, Is.EqualTo(address));
+                    });
                 });
         }
 
@@ -68,7 +79,7 @@
         {
             var correlationId = Guid.NewGuid().ToString();
 
-            return Verify(new OutgoingMessageBuilder().CorrelationId(correlationId), result => Assert.AreEqual(correlationId, result.Headers[Headers.CorrelationId]));
+            return Verify(new OutgoingMessageBuilder().CorrelationId(correlationId), result => Assert.That(result.Headers[Headers.CorrelationId], Is.EqualTo(correlationId)));
         }
 
         [Test]
@@ -76,9 +87,12 @@
         {
             return Verify(new OutgoingMessageBuilder().WithHeader(BasicPropertiesExtensions.UseNonPersistentDeliveryHeader, true.ToString()), (message, basicDeliverEventArgs) =>
             {
-                Assert.False(basicDeliverEventArgs.BasicProperties.Persistent);
-                Assert.False(basicDeliverEventArgs.BasicProperties.Headers.ContainsKey(BasicPropertiesExtensions.UseNonPersistentDeliveryHeader), "Temp header should not be visible on the wire");
-                Assert.True(message.Headers.ContainsKey(BasicPropertiesExtensions.UseNonPersistentDeliveryHeader), "Temp header should not removed to make sure that retries keeps the setting");
+                Assert.Multiple(() =>
+                {
+                    Assert.That(basicDeliverEventArgs.BasicProperties.Persistent, Is.False);
+                    Assert.That(basicDeliverEventArgs.BasicProperties.Headers?.TryGetValue(BasicPropertiesExtensions.UseNonPersistentDeliveryHeader, out _), Is.Null.Or.False, "Temp header should not be visible on the wire");
+                    Assert.That(message.Headers.ContainsKey(BasicPropertiesExtensions.UseNonPersistentDeliveryHeader), Is.True, "Temp header should not removed to make sure that retries keeps the setting");
+                });
             });
         }
 
@@ -88,12 +102,13 @@
             return Verify(new OutgoingMessageBuilder().WithHeader("h1", "v1").WithHeader("h2", "v2"),
                 result =>
                 {
-                    Assert.AreEqual("v1", result.Headers["h1"]);
-                    Assert.AreEqual("v2", result.Headers["h2"]);
+                    Assert.Multiple(() =>
+                    {
+                        Assert.That(result.Headers["h1"], Is.EqualTo("v1"));
+                        Assert.That(result.Headers["h2"], Is.EqualTo("v2"));
+                    });
                 });
         }
-
-        protected override IEnumerable<string> AdditionalReceiverQueues => new[] { QueueToReceiveOn };
 
         async Task Verify(OutgoingMessageBuilder builder, Action<IncomingMessage, BasicDeliverEventArgs> assertion, CancellationToken cancellationToken = default)
         {
@@ -103,7 +118,7 @@
 
             var messageId = operations.MulticastTransportOperations.FirstOrDefault()?.Message.MessageId ?? operations.UnicastTransportOperations.FirstOrDefault()?.Message.MessageId;
 
-            var result = Consume(messageId, QueueToReceiveOn);
+            var result = await Consume(messageId, QueueToReceiveOn, cancellationToken);
 
             var converter = new MessageConverter(MessageConverter.DefaultMessageIdStrategy);
             var convertedHeaders = converter.RetrieveHeaders(result);
@@ -118,32 +133,23 @@
 
         Task Verify(OutgoingMessageBuilder builder, Action<BasicDeliverEventArgs> assertion, CancellationToken cancellationToken = default) => Verify(builder, (t, r) => assertion(r), cancellationToken);
 
-        BasicDeliverEventArgs Consume(string id, string queueToReceiveOn)
+        async Task<BasicDeliverEventArgs> Consume(string id, string queueToReceiveOn, CancellationToken cancellationToken)
         {
-            using (var connection = connectionFactory.CreateConnection("Consume"))
-            using (var channel = connection.CreateModel())
+            using var connection = await connectionFactory.CreateConnection("Consume", cancellationToken: cancellationToken);
+            using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
+
+            var message = await channel.BasicGetAsync(queueToReceiveOn, false, cancellationToken) ?? throw new InvalidOperationException($"No message found in queue. Expected MessageId: {id}");
+
+            if (message.BasicProperties.MessageId != id)
             {
-                var message = channel.BasicGet(queueToReceiveOn, false);
-
-                if (message == null)
-                {
-                    throw new InvalidOperationException("No message found in queue");
-                }
-
-                if (message.BasicProperties.MessageId != id)
-                {
-                    throw new InvalidOperationException("Unexpected message found in queue");
-                }
-
-                channel.BasicAck(message.DeliveryTag, false);
-
-                return new BasicDeliverEventArgs("", message.DeliveryTag, message.Redelivered, message.Exchange, message.RoutingKey, message.BasicProperties, message.Body);
+                throw new InvalidOperationException($"Unexpected message found in queue. Expected MessageId: {id} Actual MessageId: {message.BasicProperties.MessageId}");
             }
+
+            await channel.BasicAckAsync(message.DeliveryTag, false, cancellationToken);
+
+            return new BasicDeliverEventArgs("", message.DeliveryTag, message.Redelivered, message.Exchange, message.RoutingKey, message.BasicProperties, message.Body);
         }
 
-        class MyMessage
-        {
-
-        }
+        class MyMessage;
     }
 }

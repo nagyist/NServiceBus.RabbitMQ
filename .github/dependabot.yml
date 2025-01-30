@@ -1,10 +1,26 @@
 version: 2
+registries:
+  particular-packages:
+    type: nuget-feed
+    url: https://f.feedz.io/particular-software/packages/nuget/index.json
 updates:
 - package-ecosystem: nuget
-  directory: "/"
+  directory: "/src"
+  registries: "*"
   schedule:
     interval: daily
   open-pull-requests-limit: 1000
+  groups:
+    AWSSDK:
+      patterns:
+        - "AWSSDK.*"
+    NServiceBusCore:
+      patterns:
+        - "NServiceBus"
+        - "NServiceBus.AcceptanceTesting"
+        - "NServiceBus.AcceptanceTests.Sources"
+        - "NServiceBus.PersistenceTests.Sources"
+        - "NServiceBus.TransportTests.Sources"
   ignore:
     # Particular.Analyzers updates are distributed via RepoStandards
     - dependency-name: "Particular.Analyzers"

@@ -16,7 +16,7 @@ class ConfigureRabbitMQTransportInfrastructure : IConfigureTransportInfrastructu
     {
         var connectionString = Environment.GetEnvironmentVariable("RabbitMQTransport_ConnectionString") ?? "host=localhost";
 
-        var transport = new RabbitMQTransport(RoutingTopology.Conventional(QueueType.Classic), connectionString);
+        var transport = new RabbitMQTransport(RoutingTopology.Conventional(QueueType.Classic), connectionString, false);
 
         return transport;
     }
@@ -27,37 +27,35 @@ class ConfigureRabbitMQTransportInfrastructure : IConfigureTransportInfrastructu
             "mainReceiver",
             inputQueue,
             true,
-            true, errorQueueName);
+            false,
+            errorQueueName);
 
-        var transport = await transportDefinition.Initialize(hostSettings, new[] { mainReceiverSettings }, new[] { errorQueueName }, cancellationToken);
+        var transport = await transportDefinition.Initialize(hostSettings, [mainReceiverSettings], [errorQueueName], cancellationToken);
 
-        queuesToCleanUp = new[] { transport.ToTransportAddress(inputQueue), errorQueueName };
+        queuesToCleanUp = [transport.ToTransportAddress(inputQueue), errorQueueName];
         return transport;
     }
 
-    public Task Cleanup(CancellationToken cancellationToken = default)
+    public async Task Cleanup(CancellationToken cancellationToken = default)
     {
         if (queuesToCleanUp == null)
         {
-            return Task.CompletedTask;
+            return;
         }
 
-        using (var connection = ConnectionHelper.ConnectionFactory.CreateConnection("Test Queue Purger"))
-        using (var channel = connection.CreateModel())
+        using var connection = await ConnectionHelper.ConnectionFactory.CreateConnectionAsync("Test Queue Purger", cancellationToken);
+        using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
+        foreach (var queue in queuesToCleanUp)
         {
-            foreach (var queue in queuesToCleanUp)
+            try
             {
-                try
-                {
-                    channel.QueuePurge(queue);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("Unable to clear queue {0}: {1}", queue, ex);
-                }
+                await channel.QueuePurgeAsync(queue, cancellationToken);
+            }
+            catch (Exception ex) when (!ex.IsCausedBy(cancellationToken))
+            {
+                Console.WriteLine("Unable to clear queue {0}: {1}", queue, ex);
             }
         }
-        return Task.CompletedTask;
     }
 
     string[] queuesToCleanUp;

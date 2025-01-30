@@ -5,6 +5,7 @@
     using System.Security.Cryptography.X509Certificates;
     using System.Threading;
     using System.Threading.Tasks;
+    using RabbitMQ.Client;
     using RabbitMQ.Client.Events;
     using Transport;
     using Transport.RabbitMQ;
@@ -13,7 +14,7 @@
     /// <summary>
     /// Transport definition for RabbitMQ.
     /// </summary>
-    public partial class RabbitMQTransport : TransportDefinition
+    public class RabbitMQTransport : TransportDefinition
     {
         TimeSpan heartbeatInterval = TimeSpan.FromSeconds(60);
         TimeSpan networkRecoveryInterval = TimeSpan.FromSeconds(10);
@@ -21,7 +22,7 @@
         PrefetchCountCalculation prefetchCountCalculation = maxConcurrency => 3 * maxConcurrency;
         TimeSpan timeToWaitBeforeTriggeringCircuitBreaker = TimeSpan.FromMinutes(2);
 
-        readonly List<(string hostName, int port, bool useTls)> additionalClusterNodes = new();
+        readonly List<(string hostName, int port, bool useTls)> additionalClusterNodes = [];
 
         /// <summary>
         /// Creates a new instance of the RabbitMQ transport.
@@ -34,8 +35,27 @@
                 supportsPublishSubscribe: true,
                 supportsTTBR: true)
         {
-            Guard.AgainstNull(nameof(routingTopology), routingTopology);
-            Guard.AgainstNull(nameof(connectionString), connectionString);
+            ArgumentNullException.ThrowIfNull(routingTopology);
+            ArgumentNullException.ThrowIfNull(connectionString);
+
+            RoutingTopology = routingTopology.Create();
+            ConnectionConfiguration = ConnectionConfiguration.Create(connectionString);
+        }
+
+        /// <summary>
+        /// Creates a new instance of the RabbitMQ transport.
+        /// </summary>
+        /// <param name="routingTopology">The routing topology to use.</param>
+        /// <param name="connectionString">The connection string to use when connecting to the broker.</param>
+        /// <param name="enableDelayedDelivery">Should the delayed delivery infrastructure be created by the endpoint</param>
+        public RabbitMQTransport(RoutingTopology routingTopology, string connectionString, bool enableDelayedDelivery)
+            : base(TransportTransactionMode.ReceiveOnly,
+                supportsDelayedDelivery: enableDelayedDelivery,
+                supportsPublishSubscribe: true,
+                supportsTTBR: true)
+        {
+            ArgumentNullException.ThrowIfNull(routingTopology);
+            ArgumentNullException.ThrowIfNull(connectionString);
 
             RoutingTopology = routingTopology.Create();
             ConnectionConfiguration = ConnectionConfiguration.Create(connectionString);
@@ -54,7 +74,7 @@
             get => messageIdStrategy;
             set
             {
-                Guard.AgainstNull("value", value);
+                ArgumentNullException.ThrowIfNull(value);
                 messageIdStrategy = value;
             }
         }
@@ -67,10 +87,26 @@
             get => timeToWaitBeforeTriggeringCircuitBreaker;
             set
             {
-                Guard.AgainstNegativeAndZero("value", value);
+                ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(value, TimeSpan.Zero);
                 timeToWaitBeforeTriggeringCircuitBreaker = value;
             }
         }
+
+        /// <summary>
+        /// Gets or sets the action that allows customization of the native <see cref="BasicProperties"/> 
+        /// just before it is dispatched to the rabbitmq client. 
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// When provided, the action is invoked after all other transport customizations have executed.
+        /// This means that any changes made by the native customization logic can override or conflict
+        /// with previous transport-level adjustments. This extension point should be used with caution,
+        /// as modifying a native message at this stage can lead to unintended behavior if the message
+        /// content or properties are altered in ways that do not align with expectations.
+        /// with expectations elsewhere in the system.
+        /// </para>
+        /// </remarks>
+        public Action<IOutgoingTransportOperation, IBasicProperties> OutgoingNativeMessageCustomization { get; set; }
 
         /// <summary>
         /// The calculation method for the prefetch count. The default is 3 times the maximum concurrency value.
@@ -80,7 +116,7 @@
             get => prefetchCountCalculation;
             set
             {
-                Guard.AgainstNull("value", value);
+                ArgumentNullException.ThrowIfNull(value);
                 prefetchCountCalculation = value;
             }
         }
@@ -108,7 +144,7 @@
             get => heartbeatInterval;
             set
             {
-                Guard.AgainstNegativeAndZero("value", value);
+                ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(value, TimeSpan.Zero);
                 heartbeatInterval = value;
             }
         }
@@ -121,7 +157,7 @@
             get => networkRecoveryInterval;
             set
             {
-                Guard.AgainstNegativeAndZero("value", value);
+                ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(value, TimeSpan.Zero);
                 networkRecoveryInterval = value;
             }
         }
@@ -133,7 +169,7 @@
         /// <param name="useTls">Indicates if the connection to the node should be secured with TLS.</param>
         public void AddClusterNode(string hostName, bool useTls)
         {
-            Guard.AgainstNullAndEmpty(nameof(hostName), hostName);
+            ArgumentException.ThrowIfNullOrWhiteSpace(hostName);
 
             additionalClusterNodes.Add((hostName, -1, useTls));
         }
@@ -146,14 +182,14 @@
         /// <param name="useTls">Indicates if the connection to the node should be secured with TLS.</param>
         public void AddClusterNode(string hostName, int port, bool useTls)
         {
-            Guard.AgainstNullAndEmpty(nameof(hostName), hostName);
-            Guard.AgainstNegativeAndZero(nameof(port), port);
+            ArgumentException.ThrowIfNullOrWhiteSpace(hostName);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(port);
 
             additionalClusterNodes.Add((hostName, port, useTls));
         }
 
         /// <inheritdoc />
-        public override Task<TransportInfrastructure> Initialize(HostSettings hostSettings, ReceiveSettings[] receivers, string[] sendingAddresses, CancellationToken cancellationToken = default)
+        public override async Task<TransportInfrastructure> Initialize(HostSettings hostSettings, ReceiveSettings[] receivers, string[] sendingAddresses, CancellationToken cancellationToken = default)
         {
             ValidateAndApplyLegacyConfiguration();
 
@@ -164,36 +200,82 @@
                 certCollection = new X509Certificate2Collection(ClientCertificate);
             }
 
-            var connectionFactory = new ConnectionFactory(hostSettings.Name, ConnectionConfiguration, certCollection, !ValidateRemoteCertificate,
-                UseExternalAuthMechanism, HeartbeatInterval, NetworkRecoveryInterval, additionalClusterNodes);
+            var connectionFactory = new ConnectionFactory(
+                hostSettings.Name,
+                ConnectionConfiguration,
+                certCollection,
+                !ValidateRemoteCertificate,
+                UseExternalAuthMechanism,
+                HeartbeatInterval,
+                NetworkRecoveryInterval,
+                additionalClusterNodes
+            );
 
             var channelProvider = new ChannelProvider(connectionFactory, NetworkRecoveryInterval, RoutingTopology);
-            channelProvider.CreateConnection();
+            await channelProvider.CreateConnection(cancellationToken).ConfigureAwait(false);
 
             var converter = new MessageConverter(MessageIdStrategy);
 
-            var infra = new RabbitMQTransportInfrastructure(hostSettings, receivers, connectionFactory,
-                RoutingTopology, channelProvider, converter, TimeToWaitBeforeTriggeringCircuitBreaker,
-                PrefetchCountCalculation, NetworkRecoveryInterval);
+            var infra = new RabbitMQTransportInfrastructure(
+                hostSettings,
+                receivers,
+                connectionFactory,
+                RoutingTopology,
+                channelProvider,
+                converter,
+                OutgoingNativeMessageCustomization,
+                TimeToWaitBeforeTriggeringCircuitBreaker,
+                PrefetchCountCalculation,
+                NetworkRecoveryInterval,
+                SupportsDelayedDelivery
+            );
 
             if (hostSettings.SetupInfrastructure)
             {
-                infra.SetupInfrastructure(sendingAddresses);
+                await infra.SetupInfrastructure(sendingAddresses, cancellationToken).ConfigureAwait(false);
             }
 
-            return Task.FromResult<TransportInfrastructure>(infra);
+            return infra;
         }
-
-#pragma warning disable CS0672 // Member overrides obsolete member
-        /// <inheritdoc />
-        [ObsoleteEx(
-            Message = "Inject the ITransportAddressResolver type to access the address translation mechanism at runtime. See the NServiceBus version 8 upgrade guide for further details.",
-            TreatAsErrorFromVersion = "9",
-            RemoveInVersion = "10")]
-        public override string ToTransportAddress(QueueAddress address) => RabbitMQTransportInfrastructure.TranslateAddress(address);
-#pragma warning restore CS0672 // Member overrides obsolete member
 
         /// <inheritdoc />
         public override IReadOnlyCollection<TransportTransactionMode> GetSupportedTransactionModes() => new[] { TransportTransactionMode.ReceiveOnly };
+
+        // Remove all Legacy API stuff below when PreObsoletes are converted
+
+        internal string LegacyApiConnectionString { get; set; }
+
+        internal Func<bool, IRoutingTopology> TopologyFactory { get; set; }
+
+        internal bool UseDurableExchangesAndQueues { get; set; } = true;
+
+        bool legacyMode;
+
+        internal RabbitMQTransport() : base(TransportTransactionMode.ReceiveOnly, true, true, true)
+        {
+            legacyMode = true;
+        }
+
+        void ValidateAndApplyLegacyConfiguration()
+        {
+            if (!legacyMode)
+            {
+                return;
+            }
+
+            if (TopologyFactory == null)
+            {
+                throw new Exception("A routing topology must be configured with one of the 'EndpointConfiguration.UseTransport<RabbitMQTransport>().UseXXXXRoutingTopology()` methods. Most new projects should use the Conventional routing topology.");
+            }
+
+            RoutingTopology = TopologyFactory(UseDurableExchangesAndQueues);
+
+            if (string.IsNullOrEmpty(LegacyApiConnectionString))
+            {
+                throw new Exception("A connection string must be configured with 'EndpointConfiguration.UseTransport<RabbitMQTransport>().ConnectionString()` method.");
+            }
+
+            ConnectionConfiguration = ConnectionConfiguration.Create(LegacyApiConnectionString);
+        }
     }
 }

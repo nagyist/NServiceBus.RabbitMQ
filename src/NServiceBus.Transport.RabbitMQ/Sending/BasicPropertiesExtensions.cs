@@ -1,10 +1,8 @@
 ﻿namespace NServiceBus.Transport.RabbitMQ
 {
     using System;
-    using System.Collections.Generic;
     using System.Globalization;
     using System.Linq;
-    using System.Text;
     using global::RabbitMQ.Client;
 
     static class BasicPropertiesExtensions
@@ -16,7 +14,7 @@
                 properties.MessageId = message.MessageId;
             }
 
-            var messageHeaders = message.Headers ?? new Dictionary<string, string>();
+            var messageHeaders = message.Headers ?? [];
 
             var delayed = CalculateDelay(dispatchProperties, out var delay);
 
@@ -104,20 +102,6 @@
             return delayed;
         }
 
-        public static void SetConfirmationId(this IBasicProperties properties, ulong confirmationId)
-        {
-            properties.Headers[ConfirmationIdHeader] = confirmationId.ToString();
-        }
-
-        public static bool TryGetConfirmationId(this IBasicProperties properties, out ulong confirmationId)
-        {
-            confirmationId = 0;
-
-            return properties.Headers.TryGetValue(ConfirmationIdHeader, out var value) &&
-                ulong.TryParse(Encoding.UTF8.GetString(value as byte[] ?? Array.Empty<byte>()), out confirmationId);
-        }
-
-        public const string ConfirmationIdHeader = "NServiceBus.Transport.RabbitMQ.ConfirmationId";
         public const string UseNonPersistentDeliveryHeader = "NServiceBus.Transport.RabbitMQ.UseNonPersistentDelivery";
     }
 }

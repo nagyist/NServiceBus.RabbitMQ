@@ -1,6 +1,7 @@
 ﻿namespace NServiceBus.Transport.RabbitMQ.AcceptanceTests
 {
     using System;
+    using System.Threading.Tasks;
     using AcceptanceTesting;
     using NServiceBus.AcceptanceTests;
     using NServiceBus.AcceptanceTests.EndpointTemplates;
@@ -9,12 +10,12 @@
     public class When_classic_endpoint_uses_quorum_error_queue : NServiceBusAcceptanceTest
     {
         [Test]
-        public void Should_fail_to_start()
+        public async Task Should_fail_to_start()
         {
-            using (var connection = ConnectionHelper.ConnectionFactory.CreateConnection())
-            using (var channel = connection.CreateModel())
+            using (var connection = await ConnectionHelper.ConnectionFactory.CreateConnectionAsync())
+            using (var channel = await connection.CreateChannelAsync())
             {
-                channel.DeclareQuorumQueue("rabbitmq.transport.tests.quorum-error");
+                await channel.DeclareQuorumQueue("rabbitmq.transport.tests.quorum-error");
             }
 
             var exception = Assert.CatchAsync<Exception>(async () => await Scenario.Define<ScenarioContext>()
@@ -22,8 +23,8 @@
                 .Done(c => c.EndpointsStarted)
                 .Run());
 
-            StringAssert.Contains("PRECONDITION_FAILED - inequivalent arg 'x-queue-type' for queue 'rabbitmq.transport.tests.quorum-error'", exception.Message);
-            StringAssert.Contains("received none but current is the value 'quorum'", exception.Message);
+            Assert.That(exception.Message, Does.Contain("PRECONDITION_FAILED - inequivalent arg 'x-queue-type' for queue 'rabbitmq.transport.tests.quorum-error'"));
+            Assert.That(exception.Message, Does.Contain("received none but current is the value 'quorum'"));
         }
 
         class ClassicQueueEndpoint : EndpointConfigurationBuilder

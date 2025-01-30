@@ -5,6 +5,7 @@
     using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
+    using global::RabbitMQ.Client;
 
     sealed class RabbitMQTransportInfrastructure : TransportInfrastructure
     {
@@ -12,17 +13,22 @@
         readonly ChannelProvider channelProvider;
         readonly IRoutingTopology routingTopology;
         readonly TimeSpan networkRecoveryInterval;
+        readonly bool supportsDelayedDelivery;
 
-        public RabbitMQTransportInfrastructure(HostSettings hostSettings, ReceiveSettings[] receiverSettings, ConnectionFactory connectionFactory, IRoutingTopology routingTopology,
+        public RabbitMQTransportInfrastructure(HostSettings hostSettings, ReceiveSettings[] receiverSettings,
+            ConnectionFactory connectionFactory, IRoutingTopology routingTopology,
             ChannelProvider channelProvider, MessageConverter messageConverter,
-            TimeSpan timeToWaitBeforeTriggeringCircuitBreaker, PrefetchCountCalculation prefetchCountCalculation, TimeSpan networkRecoveryInterval)
+            Action<IOutgoingTransportOperation, IBasicProperties> messageCustomization,
+            TimeSpan timeToWaitBeforeTriggeringCircuitBreaker, PrefetchCountCalculation prefetchCountCalculation,
+            TimeSpan networkRecoveryInterval, bool supportsDelayedDelivery)
         {
             this.connectionFactory = connectionFactory;
             this.routingTopology = routingTopology;
             this.channelProvider = channelProvider;
             this.networkRecoveryInterval = networkRecoveryInterval;
+            this.supportsDelayedDelivery = supportsDelayedDelivery;
 
-            Dispatcher = new MessageDispatcher(channelProvider);
+            Dispatcher = new MessageDispatcher(channelProvider, messageCustomization, supportsDelayedDelivery);
             Receivers = receiverSettings.Select(x => CreateMessagePump(hostSettings, x, messageConverter, timeToWaitBeforeTriggeringCircuitBreaker, prefetchCountCalculation))
                 .ToDictionary(x => x.Id, x => x);
         }
@@ -34,35 +40,39 @@
             return new MessagePump(settings, connectionFactory, routingTopology, messageConverter, consumerTag, channelProvider, timeToWaitBeforeTriggeringCircuitBreaker, prefetchCountCalculation, hostSettings.CriticalErrorAction, networkRecoveryInterval);
         }
 
-        internal void SetupInfrastructure(string[] sendingQueues)
+        internal async Task SetupInfrastructure(string[] sendingQueues, CancellationToken cancellationToken = default)
         {
-            using var connection = connectionFactory.CreateAdministrationConnection();
+            using var connection = await connectionFactory.CreateAdministrationConnection(cancellationToken).ConfigureAwait(false);
 
-            connection.VerifyBrokerRequirements();
+            await connection.VerifyBrokerRequirements(cancellationToken).ConfigureAwait(false);
 
-            using var channel = connection.CreateModel();
+            using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            DelayInfrastructure.Build(channel);
+            if (supportsDelayedDelivery)
+            {
+                await DelayInfrastructure.Build(channel, cancellationToken).ConfigureAwait(false);
+            }
 
             var receivingQueues = Receivers.Select(r => r.Value.ReceiveAddress).ToArray();
 
-            routingTopology.Initialize(channel, receivingQueues, sendingQueues);
+            await routingTopology.Initialize(channel, receivingQueues, sendingQueues, cancellationToken).ConfigureAwait(false);
 
-            foreach (string receivingAddress in receivingQueues)
+            if (supportsDelayedDelivery)
             {
-                routingTopology.BindToDelayInfrastructure(channel, receivingAddress, DelayInfrastructure.DeliveryExchange, DelayInfrastructure.BindingKey(receivingAddress));
+                foreach (string receivingAddress in receivingQueues)
+                {
+                    await routingTopology.BindToDelayInfrastructure(channel, receivingAddress,
+                        DelayInfrastructure.DeliveryExchange, DelayInfrastructure.BindingKey(receivingAddress), cancellationToken).ConfigureAwait(false);
+                }
             }
         }
 
-        public override Task Shutdown(CancellationToken cancellationToken = default)
+        public override async Task Shutdown(CancellationToken cancellationToken = default)
         {
-            foreach (IMessageReceiver receiver in Receivers.Values)
-            {
-                ((MessagePump)receiver).Dispose();
-            }
+            await Task.WhenAll(Receivers.Values.Select(r => r.StopReceive(cancellationToken)))
+                .ConfigureAwait(false);
 
-            channelProvider.Dispose();
-            return Task.CompletedTask;
+            await channelProvider.DisposeAsync().ConfigureAwait(false);
         }
 
         public override string ToTransportAddress(QueueAddress address) => TranslateAddress(address);
